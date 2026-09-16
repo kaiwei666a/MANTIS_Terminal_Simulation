@@ -3,13 +3,7 @@ from __future__ import annotations
 
 import re
 import shlex
-from typing import Any, Dict, Optional
-
-from tools.common import command_only_parameters, parse_exact_command_arguments
-
-
-TOOL_NAME = "render_ubuntu_manual_or_help"
-
+from typing import Dict, Optional
 
 _MANUALS: Dict[str, Dict[str, str]] = {
     "ls": {
@@ -137,21 +131,6 @@ def is_manual_or_help_command(command: str) -> bool:
     return False
 
 
-def tool_definition(command: str) -> Dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": TOOL_NAME,
-            "description": (
-                "Render exact Ubuntu 22.04 terminal output for a man, whatis, or Bash help command. "
-                "Call this tool whenever the input command starts with man, whatis, or help."
-            ),
-            "parameters": command_only_parameters(command),
-            "strict": True,
-        },
-    }
-
-
 def _render_man_page(topic: str) -> str:
     page = _MANUALS.get(topic)
     if page is None:
@@ -263,13 +242,3 @@ def render_manual_or_help(command: str) -> Optional[str]:
     if tokens[0] == "whatis":
         return _render_whatis(tokens)
     return None
-
-
-def execute_tool_call(tool_name: str, arguments: str, original_command: str) -> str:
-    if tool_name != TOOL_NAME:
-        raise ValueError(f"unknown tool: {tool_name}")
-    parse_exact_command_arguments(arguments, original_command)
-    rendered = render_manual_or_help(original_command)
-    if rendered is None:
-        raise ValueError("tool received a command it does not handle")
-    return rendered

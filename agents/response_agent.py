@@ -6,24 +6,15 @@ import json
 from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
-from tools.ubuntu_authoritative_tool import (
-    TOOL_NAME as AUTHORITATIVE_TOOL_NAME,
-    execute_tool_call as execute_authoritative_tool,
-    tool_definition as authoritative_tool_definition,
-)
-from tools.common import forced_tool_choice, tool_call_arguments
 from tools.ubuntu_help_tools import (
-    TOOL_NAME as UBUNTU_HELP_TOOL_NAME,
-    execute_tool_call as execute_ubuntu_help_tool,
     is_manual_or_help_command,
     render_manual_or_help,
-    tool_definition as ubuntu_help_tool_definition,
 )
 
 DEFAULT_RESPONSE_MODEL = os.getenv("RESPONSE_AGENT_MODEL", "gpt-5.4-mini")
 
 MAX_NEW_TOKENS = int(os.getenv("RESPONSE_AGENT_MAX_NEW_TOKENS", "512"))
-TOP_MAX_NEW_TOKENS = int(os.getenv("TOP_MAX_COMPLETION_TOKENS", "1200"))
+TOP_MAX_NEW_TOKENS = int(os.getenv("TOP_MAX_COMPLETION_TOKENS", "1600"))
 TEMPERATURE = float(os.getenv("RESPONSE_AGENT_TEMPERATURE", "0.3"))
 TOP_P = float(os.getenv("RESPONSE_AGENT_TOP_P", "0.95"))
 
@@ -140,26 +131,16 @@ def _generate_gpt(
     system_log: Any,
     model: Optional[str] = None,
 ) -> str:
+    if is_manual_or_help_command(command):
+        rendered = render_manual_or_help(command)
+        if rendered is not None:
+            return rendered
     messages = _build_messages(command, planning_advice, session_log, system_log)
-    use_help_tool = is_manual_or_help_command(command)
-    if use_help_tool:
-        tools = [ubuntu_help_tool_definition(command)]
-        tool_choice = forced_tool_choice(UBUNTU_HELP_TOOL_NAME)
-    else:
-        tools = None
-        tool_choice = None
 
     if DUMP_PROMPT:
         try:
             with open(DUMP_PROMPT_PATH, "w", encoding="utf-8") as f:
-                dumped: Any = messages
-                if tools is not None:
-                    dumped = {
-                        "messages": messages,
-                        "tools": tools,
-                        "tool_choice": tool_choice,
-                    }
-                f.write(json.dumps(dumped, ensure_ascii=False, indent=2))
+                f.write(json.dumps(messages, ensure_ascii=False, indent=2))
         except Exception:
             pass
 
@@ -172,39 +153,9 @@ def _generate_gpt(
         top_p=TOP_P,
         max_completion_tokens=MAX_NEW_TOKENS,
     )
-    if tools is not None:
-        request["tools"] = tools
-        request["tool_choice"] = tool_choice
-        request["parallel_tool_calls"] = False
-    if use_help_tool and str(getattr(client, "api_key", "")) == "YOUR_API_KEY_HERE":
-        fallback = render_manual_or_help(command)
-        if fallback is not None:
-            return fallback
-    try:
-        resp = client.chat.completions.create(**request)
-    except Exception:
-        if use_help_tool:
-            fallback = render_manual_or_help(command)
-            if fallback is not None:
-                return fallback
-        raise
+    resp = client.chat.completions.create(**request)
 
     message = resp.choices[0].message
-    if use_help_tool:
-        arguments = tool_call_arguments(message, UBUNTU_HELP_TOOL_NAME)
-        if arguments is not None:
-            try:
-                return execute_ubuntu_help_tool(
-                    UBUNTU_HELP_TOOL_NAME,
-                    arguments,
-                    command,
-                )
-            except ValueError:
-                pass
-        fallback = render_manual_or_help(command)
-        if fallback is not None:
-            return fallback
-
     raw = (message.content or "").strip()
     return _extract_code_block(raw)
 
@@ -230,28 +181,35 @@ def render_response(
 
 def render_top_response(
     top_state: Dict[str, Any],
+    terminal_width: int = 80,
+    terminal_height: int = 24,
     client: Optional[OpenAI] = None,
     model: Optional[str] = None,
-    authoritative_frame: Optional[str] = None,
 ) -> str:
-    c = client or init_client()
+    """Ask the model to turn measured state into a full-screen top frame."""
+    width = max(20, int(terminal_width or 80))
+    height = max(8, int(terminal_height or 24))
+    process_rows = max(1, height - 7)
     messages = [
         {
             "role": "developer",
             "content": (
-                "You render exactly one Ubuntu 22.04 `top` terminal frame. "
-                "The supplied JSON is the authoritative live measurement for this refresh. "
-                "Use every numeric value exactly as supplied, with normal `top` alignment. "
-                "Include the top/load line, Tasks, %Cpu(s), MiB Mem, MiB Swap, a process header, "
-                "and the supplied processes. Do not display a quit/help hint. "
-                "If an authoritative terminal-output tool is supplied, call it instead of rendering text. "
-                "Return raw terminal text only: no Markdown fence, explanation, or command echo."
+                "Render one realistic Ubuntu 22.04 top screen as raw terminal text. "
+                f"The screen is {width} columns by {height} rows. Return exactly {height} lines: "
+                "five summary lines, one blank line, one process header, then "
+                f"exactly {process_rows} process rows. Never use Markdown or ANSI escape sequences. "
+                "Use the supplied clock, uptime, load, CPU and memory values without changing them. "
+                "Keep every supplied process and its supplied values. If more rows are needed, fill them "
+                "with distinct, realistic low-activity Ubuntu background processes that fit the simulated "
+                "host; use unique positive PIDs and make the Tasks counts consistent with the completed "
+                "process list. Do not leave blank process rows. Clip each line to the requested width."
             ),
         },
         {
             "role": "user",
             "content": json.dumps(
                 {
+                    "terminal": {"width": width, "height": height},
                     "top_state": top_state,
                 },
                 ensure_ascii=False,
@@ -259,37 +217,15 @@ def render_top_response(
             ),
         },
     ]
-    request: Dict[str, Any] = dict(
+    c = client or init_client()
+    resp = c.chat.completions.create(
         model=model or DEFAULT_RESPONSE_MODEL,
         messages=messages,
         store=False,
         reasoning_effort="none",
-        temperature=0.0,
-        max_completion_tokens=TOP_MAX_NEW_TOKENS,
+        temperature=0.2,
+        top_p=TOP_P,
+        max_completion_tokens=min(4000, max(TOP_MAX_NEW_TOKENS, height * 60)),
     )
-    if authoritative_frame is not None:
-        request["tools"] = [authoritative_tool_definition("top")]
-        request["tool_choice"] = forced_tool_choice(AUTHORITATIVE_TOOL_NAME)
-        request["parallel_tool_calls"] = False
-    resp = c.chat.completions.create(**request)
-    message = resp.choices[0].message
-    if authoritative_frame is not None:
-        arguments = tool_call_arguments(message, AUTHORITATIVE_TOOL_NAME)
-        if arguments is not None:
-            try:
-                return execute_authoritative_tool(
-                    AUTHORITATIVE_TOOL_NAME,
-                    arguments,
-                    "top",
-                    authoritative_frame,
-                ).strip("\r\n")
-            except ValueError:
-                pass
-        return authoritative_frame.strip("\r\n")
-    raw = message.content or ""
+    raw = resp.choices[0].message.content or ""
     return _extract_code_block(raw).strip("\r\n")
-
-
-
-
-

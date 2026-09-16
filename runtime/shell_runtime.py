@@ -222,7 +222,7 @@ def run_agent_shell(
         state, _top_own_pid = build_top_state(syslog, _top_session_start, _top_cpu_time_by_pid, _top_own_pid)
         return state
 
-    def _top_frame() -> str:
+    def _top_frame(terminal_width: int, terminal_height: int) -> str:
         nonlocal _top_last_frame_time
 
         refresh_system_log_for_planning(system_log, vuln_agent)
@@ -233,25 +233,30 @@ def run_agent_shell(
 
         state = _build_top_state(system_log)
         update_time_plus(state["processes"], delta, _top_cpu_time_by_pid)
-        authoritative_frame = render_top_frame_fallback(state)
-
+        fallback = render_top_frame_fallback(state).rstrip("\r\n")
         try:
             from agents.response_agent import render_top_response
 
             rendered = render_top_response(
                 state,
+                terminal_width=terminal_width,
+                terminal_height=terminal_height,
                 client=client,
-                authoritative_frame=authoritative_frame,
             )
             required_markers = ("top -", "Tasks:", "%Cpu(s):", "MiB Mem", "PID")
             if not rendered or not all(marker in rendered for marker in required_markers):
                 raise ValueError("LLM returned an incomplete top frame")
-            if rendered.rstrip("\r\n") != authoritative_frame.rstrip("\r\n"):
-                return authoritative_frame
-            return rendered.rstrip("\r\n")
-        except Exception as e:
-            log_attack(f"[{session_id}] top LLM refresh failed; using local fallback: {e}", "warn")
-            return authoritative_frame
+            rendered_lines = rendered.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            if len(rendered_lines) != terminal_height:
+                raise ValueError(
+                    f"LLM returned {len(rendered_lines)} top rows; expected {terminal_height}"
+                )
+            if any(not line.strip() for line in rendered_lines[7:]):
+                raise ValueError("LLM left one or more top process rows empty")
+            return rendered
+        except Exception as exc:
+            log_attack(f"[{session_id}] top LLM refresh failed; using local fallback: {exc}", "warn")
+            return fallback
 
     def _run_top_interactive(interval: float = TOP_REFRESH_SEC):
         old_timeout = None
@@ -272,10 +277,12 @@ def run_agent_shell(
             while True:
                 now = time.time()
                 if now - last_render >= interval:
-                    terminal_width = int(getattr(terminal_state, "pty_width", 80) or 80)
+                    terminal_width = max(20, int(getattr(terminal_state, "pty_width", 80) or 80))
+                    terminal_height = max(8, int(getattr(terminal_state, "pty_height", 24) or 24))
                     last_frame = style_top_interactive_frame(
-                        _top_frame(),
+                        _top_frame(terminal_width, terminal_height),
                         terminal_width=terminal_width,
+                        terminal_height=terminal_height,
                     ).replace("\n", "\r\n")
 
                     _safe_send(chan, "\x1b[H\x1b[2J")
@@ -426,17 +433,13 @@ def run_agent_shell(
         lines.extend(summary)
         return "\n".join(lines), 130 if interrupted else 0
 
-    def _nano_clear():
-        _safe_send(chan, "\x1b[H\x1b[2J")
-
-    def _nano_hide_cursor():
-        _safe_send(chan, "\x1b[?25l")
-
-    def _nano_show_cursor():
-        _safe_send(chan, "\x1b[?25h")
-
     def _nano_move_cursor(row: int, col: int):
         _safe_send(chan, f"{CSI}{row};{col}H")
+
+    def _nano_terminal_size() -> Tuple[int, int]:
+        rows = max(5, int(getattr(terminal_state, "pty_height", 24) or 24))
+        cols = max(20, int(getattr(terminal_state, "pty_width", 80) or 80))
+        return rows, cols
 
     def _clip(n: int, lo: int, hi: int) -> int:
         return max(lo, min(hi, n))
@@ -509,9 +512,8 @@ def run_agent_shell(
             except Exception:
                 pass
 
-    def _render_nano(filename: str, lines: List[str], cy: int, cx: int, msg: str, dirty: bool,
-                     rows: int = 24, cols: int = 80):
-
+    def _render_nano(filename: str, lines: List[str], cy: int, cx: int, msg: str, dirty: bool):
+        rows, cols = _nano_terminal_size()
         text_rows = max(1, rows - 3) 
         top = 0
         if cy >= top + text_rows:
@@ -519,32 +521,34 @@ def run_agent_shell(
         if cy < top:
             top = cy
 
-        _nano_clear()
-
         head = f"  GNU nano  {filename}"
         if dirty:
             head += "  [Modified]"
-        _safe_send(chan, head[:cols].ljust(cols) + "\r\n")
-
+        screen_lines = [head]
         for r in range(text_rows):
             li = top + r
-            s = lines[li] if li < len(lines) else ""
-            _safe_send(chan, s[:cols].ljust(cols) + "\r\n")
+            screen_lines.append(lines[li] if li < len(lines) else "")
+        screen_lines.extend(("^O WriteOut   ^X Exit", msg or ""))
 
-        help_line = "^O WriteOut   ^X Exit"
-        _safe_send(chan, help_line[:cols].ljust(cols) + "\r\n")
-
-        _safe_send(chan, (msg or "")[:cols].ljust(cols))
+        # Draw each row at an absolute position. Avoid CRLF and full-width
+        # padding because either can scroll the terminal when the last column
+        # or last row is reached.
+        frame = ["\x1b[?25l"]
+        for row, text in enumerate(screen_lines, start=1):
+            frame.append(f"{CSI}{row};1H{text[:cols]}{CSI}K")
+        _safe_send(chan, "".join(frame))
 
         vy = 2 + (cy - top)  
         vx = 1 + cx
         vy = _clip(vy, 2, rows - 2)
         vx = _clip(vx, 1, cols)
         _nano_move_cursor(vy, vx)
+        _safe_send(chan, "\x1b[?25h")
 
     def _run_nano_interactive(abs_path: str):
 
         old_timeout = None
+        alternate_screen = False
         try:
             try:
                 old_timeout = chan.gettimeout()
@@ -565,7 +569,8 @@ def run_agent_shell(
             dirty = False
             msg = ""
 
-            _nano_hide_cursor()
+            _safe_send(chan, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")
+            alternate_screen = True
             _render_nano(filename, lines, cy, cx, msg, dirty)
 
             while True:
@@ -669,8 +674,10 @@ def run_agent_shell(
                     continue
 
         finally:
-            _nano_show_cursor()
-            _safe_send(chan, "\r\n")
+            if alternate_screen:
+                _safe_send(chan, "\x1b[0m\x1b[?25h\x1b[?1049l\r\x1b[K")
+            else:
+                _safe_send(chan, "\x1b[?25h")
             try:
                 chan.settimeout(old_timeout)
             except Exception:

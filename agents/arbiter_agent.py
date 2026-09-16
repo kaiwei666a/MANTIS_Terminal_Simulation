@@ -22,11 +22,8 @@ from tools.ubuntu_fs_write_tools import (
     plan_deterministic_fs_write,
 )
 from tools.ubuntu_touch_tool import (
-    TOOL_NAME as TOUCH_TOOL_NAME,
-    execute_tool_call as execute_touch_tool,
     is_touch_command,
     plan_touch_command,
-    tool_definition as touch_tool_definition,
 )
 from tools.common import forced_tool_choice, sha1_text, tool_call_arguments
 from tools.ubuntu_commands import classify_known_ubuntu_command
@@ -147,52 +144,43 @@ class VulnerabilityAgentLLM:
         system_log = self.system_log
         if is_deterministic_fs_write(command, system_log):
             return plan_deterministic_fs_write(command, system_log)
+        if is_touch_command(command):
+            return plan_touch_command(command, system_log)
         c = client
         if c is None:
             from openai import OpenAI
 
             c = OpenAI(api_key=os.getenv("OPENAI_API_KEY") or "YOUR_API_KEY_HERE")
-        use_touch_tool = is_touch_command(command)
-        if use_touch_tool and str(getattr(c, "api_key", "")) == "YOUR_API_KEY_HERE":
-            return plan_touch_command(command, system_log)
-        if use_touch_tool:
-            planner_instruction = (
-                "You are handling one state-changing command in an Ubuntu 22.04 terminal simulator. "
-                "Call the required touch function with the original command unchanged. Do not return text, "
-                "Markdown, a diagnosis, or a second command. The application-owned tool parses all touch "
-                "options and atomically updates the authoritative state."
-            )
-        else:
-            planner_instruction = (
-                "You execute one state-changing command inside an Ubuntu 22.04 terminal simulator. "
-                "Call the required function exactly once. Put raw terminal output, the 0-255 exit status, "
-                "and every successful persistent change in its structured arguments; do not return Markdown "
-                "or ordinary assistant text. Use the supplied state as authoritative. Never claim success "
-                "when a necessary mutation cannot be represented. Parse the entire command with Ubuntu 22.04 "
-                "and GNU utility semantics before deciding its output or mutations. A token beginning with '-' "
-                "before a '--' delimiter is an option, not a pathname. Correctly handle combined short options, "
-                "long options, attached option values, repeated options, '--', quoted operands, missing operands, "
-                "and invalid options. Do not reinterpret an option token as a filename. Partial success must "
-                "include only mutations that really succeeded and the diagnostics and exit status Ubuntu would "
-                "produce. Allowed mutation objects are: "
-                "{op:'write_file',path,content,append?,mode?}; "
-                "{op:'touch_path',path,create?,access_time?,modification_time?,timestamp?,atime?,mtime?}; "
-                "{op:'remove_path',path,recursive?}; "
-                "{op:'make_directory',path,parents?}; "
-                "{op:'move_path',source,destination}; "
-                "{op:'copy_path',source,destination,recursive?}; "
-                "{op:'change_mode',path,mode}; "
-                "{op:'change_owner',path,user,group?}; "
-                "{op:'set_cwd',path}; "
-                "{op:'set_service',name,enabled}; "
-                "{op:'set_listener',port,protocol?,process?,present}; "
-                "{op:'set_package',name,version?,installed,commands?}; "
-                "{op:'set_environment',name,value,present}; "
-                "{op:'set_process',pid,user?,command?,state?,present}. "
-                "Filesystem paths must be absolute and confined to the authenticated user's home, /root, or "
-                "/tmp. Critical configuration writes may target only paths already present in "
-                "critical_configs.files. Use normal Ubuntu output and an empty string for silent success."
-            )
+        planner_instruction = (
+            "You execute one state-changing command inside an Ubuntu 22.04 terminal simulator. "
+            "Call the required function exactly once. Put raw terminal output, the 0-255 exit status, "
+            "and every successful persistent change in its structured arguments; do not return Markdown "
+            "or ordinary assistant text. Use the supplied state as authoritative. Never claim success "
+            "when a necessary mutation cannot be represented. Parse the entire command with Ubuntu 22.04 "
+            "and GNU utility semantics before deciding its output or mutations. A token beginning with '-' "
+            "before a '--' delimiter is an option, not a pathname. Correctly handle combined short options, "
+            "long options, attached option values, repeated options, '--', quoted operands, missing operands, "
+            "and invalid options. Do not reinterpret an option token as a filename. Partial success must "
+            "include only mutations that really succeeded and the diagnostics and exit status Ubuntu would "
+            "produce. Allowed mutation objects are: "
+            "{op:'write_file',path,content,append?,mode?}; "
+            "{op:'touch_path',path,create?,access_time?,modification_time?,timestamp?,atime?,mtime?}; "
+            "{op:'remove_path',path,recursive?}; "
+            "{op:'make_directory',path,parents?}; "
+            "{op:'move_path',source,destination}; "
+            "{op:'copy_path',source,destination,recursive?}; "
+            "{op:'change_mode',path,mode}; "
+            "{op:'change_owner',path,user,group?}; "
+            "{op:'set_cwd',path}; "
+            "{op:'set_service',name,enabled}; "
+            "{op:'set_listener',port,protocol?,process?,present}; "
+            "{op:'set_package',name,version?,installed,commands?}; "
+            "{op:'set_environment',name,value,present}; "
+            "{op:'set_process',pid,user?,command?,state?,present}. "
+            "Filesystem paths must be absolute and confined to the authenticated user's home, /root, or "
+            "/tmp. Critical configuration writes may target only paths already present in "
+            "critical_configs.files. Use normal Ubuntu output and an empty string for silent success."
+        )
         messages = [
             {
                 "role": "developer",
@@ -215,35 +203,11 @@ class VulnerabilityAgentLLM:
             temperature=0.0,
             max_completion_tokens=max(PLANNER_MAX_NEW_TOKENS, 1200),
         )
-        if use_touch_tool:
-            request["tools"] = [touch_tool_definition(command)]
-            request["tool_choice"] = forced_tool_choice(TOUCH_TOOL_NAME)
-            request["parallel_tool_calls"] = False
-        else:
-            request["tools"] = [ubuntu_command_tool_definition(command)]
-            request["tool_choice"] = forced_tool_choice(UBUNTU_COMMAND_TOOL_NAME)
-            request["parallel_tool_calls"] = False
-        try:
-            resp = c.chat.completions.create(**request)
-        except Exception:
-            if use_touch_tool:
-                return plan_touch_command(command, system_log)
-            raise
+        request["tools"] = [ubuntu_command_tool_definition(command)]
+        request["tool_choice"] = forced_tool_choice(UBUNTU_COMMAND_TOOL_NAME)
+        request["parallel_tool_calls"] = False
+        resp = c.chat.completions.create(**request)
         message = resp.choices[0].message
-        if use_touch_tool:
-            arguments = tool_call_arguments(message, TOUCH_TOOL_NAME)
-            if arguments is not None:
-                try:
-                    return execute_touch_tool(
-                        TOUCH_TOOL_NAME,
-                        arguments,
-                        command,
-                        system_log,
-                    )
-                except ValueError:
-                    pass
-            return plan_touch_command(command, system_log)
-
         arguments = tool_call_arguments(message, UBUNTU_COMMAND_TOOL_NAME)
         if arguments is not None:
             return execute_ubuntu_command_tool(

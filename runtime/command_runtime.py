@@ -69,7 +69,7 @@ def render_response_once(
     if classification != "rejection":
         response_advice += (
             "\nThis command was not explicitly rejected. Do not answer with 'command not found' merely "
-            "because its behavior is unfamiliar; infer the normal Ubuntu 22.04 behavior from the command, "
+            "because its behavior is unfamiliar, infer the normal Ubuntu 22.04 behavior from the command, "
             "options, operands, and supplied snapshot. Only an explicit rejection may be rendered as a "
             "missing executable."
         )

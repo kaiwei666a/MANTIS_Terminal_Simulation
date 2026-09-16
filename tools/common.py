@@ -31,21 +31,6 @@ def ts_utc_isoz() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def command_only_parameters(command: str) -> Dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "enum": [command],
-                "description": "The original terminal command, unchanged.",
-            }
-        },
-        "required": ["command"],
-        "additionalProperties": False,
-    }
-
-
 def forced_tool_choice(tool_name: str) -> Dict[str, Any]:
     return {"type": "function", "function": {"name": tool_name}}
 

@@ -212,12 +212,25 @@ def render_top_frame_fallback(state: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def style_top_interactive_frame(frame: str, terminal_width: int = 80) -> str:
+def style_top_interactive_frame(
+    frame: str,
+    terminal_width: int = 80,
+    terminal_height: int = 24,
+) -> str:
     width = max(20, int(terminal_width or 80))
+    height = max(8, int(terminal_height or 24))
+    # Leave the final column unused so a full-width row cannot auto-wrap and
+    # scroll the alternate screen when the last row is drawn.
+    content_width = max(1, width - 1)
+    lines = frame.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    lines = lines[:height]
+    lines.extend([""] * (height - len(lines)))
+
     styled_lines: List[str] = []
-    for line in frame.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+    for line in lines:
+        line = line[:content_width]
         if re.match(r"^\s*PID\s+USER\b", line):
-            line = f"\x1b[7m{line.ljust(max(width, len(line)))}\x1b[0m"
+            line = f"\x1b[7m{line.ljust(content_width)}\x1b[0m"
         styled_lines.append(line)
     return "\n".join(styled_lines)
 

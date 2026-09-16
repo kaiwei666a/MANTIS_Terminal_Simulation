@@ -8,10 +8,6 @@ from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.ubuntu_ls import resolve_path_kind
-from tools.common import command_only_parameters, parse_exact_command_arguments
-
-
-TOOL_NAME = "apply_ubuntu_touch"
 
 
 def is_touch_command(command: str) -> bool:
@@ -20,21 +16,6 @@ def is_touch_command(command: str) -> bool:
     except ValueError:
         return False
     return bool(tokens) and tokens[0] == "touch"
-
-
-def tool_definition(command: str) -> Dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": TOOL_NAME,
-            "description": (
-                "Parse and execute one Ubuntu 22.04 touch command. Correctly distinguish options "
-                "such as -a, -m and -c from file operands and return validated state mutations."
-            ),
-            "parameters": command_only_parameters(command),
-            "strict": True,
-        },
-    }
 
 
 def _normalize_path(cwd: str, target: str, home: str) -> str:
@@ -279,15 +260,3 @@ def plan_touch_command(command: str, system_log: Dict[str, Any]) -> Dict[str, An
         "exit_status": 1 if errors else 0,
         "mutations": mutations,
     }
-
-
-def execute_tool_call(
-    tool_name: str,
-    arguments: str,
-    original_command: str,
-    system_log: Dict[str, Any],
-) -> Dict[str, Any]:
-    if tool_name != TOOL_NAME:
-        raise ValueError(f"unknown tool: {tool_name}")
-    parse_exact_command_arguments(arguments, original_command)
-    return plan_touch_command(original_command, system_log)
