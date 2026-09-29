@@ -3,9 +3,11 @@ from __future__ import annotations
 import os
 import re
 import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
+from tools.response_tools import RESPONSE_TOOL_DEFINITIONS, dispatch_response_tool
 from tools.ubuntu_help_tools import (
     is_manual_or_help_command,
     render_manual_or_help,
@@ -51,6 +53,11 @@ TRAIN_INSTRUCTION = (
     "entries horizontally in terminal columns separated by at least two spaces, assuming an 80-column terminal. "
     "Do not put every entry on a separate line when the entries fit within 80 columns. Use one entry per line "
     "only for 'ls -1'; use one detailed record per line for 'ls -l' and 'ls -la'."
+    " You have tools available for several command families that have an authoritative, "
+    "deterministic renderer driven directly by the supplied system snapshot. When the command "
+    "belongs to one of those families, call the matching tool instead of writing the output "
+    "yourself -- it consults the real simulated state and will always be more accurate than a "
+    "generated guess. If no tool matches, just answer normally."
 )
 
 
@@ -130,6 +137,11 @@ def _generate_gpt(
     session_log: Any,
     system_log: Any,
     model: Optional[str] = None,
+    width: int = 80,
+    is_tty: bool = True,
+    login_username: str = "",
+    remote_addr: str = "",
+    login_time: Optional[datetime] = None,
 ) -> str:
     if is_manual_or_help_command(command):
         rendered = render_manual_or_help(command)
@@ -152,11 +164,44 @@ def _generate_gpt(
         temperature=TEMPERATURE,
         top_p=TOP_P,
         max_completion_tokens=MAX_NEW_TOKENS,
+        tools=RESPONSE_TOOL_DEFINITIONS,
+        tool_choice="auto",
+        parallel_tool_calls=False,
     )
     resp = client.chat.completions.create(**request)
-
     message = resp.choices[0].message
+
+    # The renderer functions do the real parsing/lookup against system_log;
+    # the model only picks which one (if any) applies by name, so the
+    # rendered text stays deterministic instead of model-generated.
+    for tool_call in getattr(message, "tool_calls", None) or []:
+        function = getattr(tool_call, "function", None)
+        if function is None:
+            continue
+        rendered = dispatch_response_tool(
+            function.name,
+            command,
+            system_log,
+            width=width,
+            is_tty=is_tty,
+            login_username=login_username,
+            remote_addr=remote_addr,
+            login_time=login_time,
+        )
+        if rendered is not None:
+            return rendered
+
     raw = (message.content or "").strip()
+    if not raw:
+        # The model called a renderer tool that turned out not to apply (or
+        # returned no content and no tool call at all). Retry once with tool
+        # use disabled so we still get plain terminal output instead of
+        # nothing, matching the pre-tool-calling fallback behavior.
+        retry_request = dict(request)
+        retry_request.pop("tools", None)
+        retry_request["tool_choice"] = "none"
+        resp = client.chat.completions.create(**retry_request)
+        raw = (resp.choices[0].message.content or "").strip()
     return _extract_code_block(raw)
 
 
@@ -167,6 +212,11 @@ def render_response(
     system_log: Any,
     client: Optional[OpenAI] = None,
     model: Optional[str] = None,
+    width: int = 80,
+    is_tty: bool = True,
+    login_username: str = "",
+    remote_addr: str = "",
+    login_time: Optional[datetime] = None,
 ) -> str:
     c = client or init_client()
     return _generate_gpt(
@@ -176,6 +226,11 @@ def render_response(
         session_log=session_log,
         system_log=system_log,
         model=model,
+        width=width,
+        is_tty=is_tty,
+        login_username=login_username,
+        remote_addr=remote_addr,
+        login_time=login_time,
     )
 
 

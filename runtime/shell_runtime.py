@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import os
 import re
 import shlex
@@ -9,13 +8,13 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from agents.arbiter_agent import VulnerabilityAgentLLM
+from agents.interactive_router import select_interactive_tool
 from system_state import load_system_log, save_system_log
 from runtime.command_runtime import (
     PlanningRuntime,
     client,
+    execute_command,
     refresh_system_log_for_planning,
-    render_command_response,
-    validate_command,
 )
 from storage.session_store import (
     append_auth_log,
@@ -37,12 +36,13 @@ from terminal_config import (
 )
 from transfer.transfer_backend import docker_fetch_file, docker_fetch_git_clone
 from tools.common import fmt_eastern, now_eastern, ts_utc_isoz
+from tools.interactive_tools import (
+    InteractiveToolContext,
+    dispatch_interactive_tool,
+)
 from tools.ubuntu_commands import (
-    classify_known_ubuntu_command,
-    command_is_available,
     ensure_default_packages,
     known_command_names,
-    primary_command_name,
 )
 from tools.ubuntu_fs_session import (
     apply_login_identity,
@@ -52,7 +52,6 @@ from tools.ubuntu_fs_session import (
 )
 from tools.ubuntu_ls import format_name_columns, list_directory_entries
 from tools.ubuntu_read_tools import (
-    command_exit_status,
     render_authoritative_shell_output,
 )
 from tools.ubuntu_session_tools import (
@@ -699,20 +698,22 @@ def run_agent_shell(
     esc_mode = False
     esc_buf = ""
 
-    def _authoritative_shell_output(command: str, prior_status: int) -> Optional[str]:
+    def _authoritative_shell_output(
+        command: str,
+        prior_status: int,
+        active_system_log: Dict[str, Any],
+    ) -> Optional[str]:
         return render_authoritative_shell_output(
             command,
             prior_status,
-            system_log,
-            current_path,
+            active_system_log,
+            str(active_system_log.get("cwd") or current_path),
             login_username,
             HOSTNAME,
             history,
-            lambda: _build_top_state(system_log)["processes"],
+            lambda: _build_top_state(active_system_log)["processes"],
         )
 
-    def _command_status(command: str, output: str, classification: str) -> int:
-        return command_exit_status(command, output, classification, system_log)
     def _accept_line():
         nonlocal buffer, cursor, history, hist_idx, system_log, current_path, file_tree, last_exit_status, sudo_authenticated
         cmd = "".join(buffer).strip()
@@ -753,265 +754,75 @@ def run_agent_shell(
                 _safe_send(chan, _prompt())
                 return None
 
-        redirect_match = re.fullmatch(r"\s*cat\s*(>>?)\s*(?:'([^']+)'|\"([^\"]+)\"|(\S+))\s*", cmd)
-        if redirect_match:
-            operator, single_name, double_name, plain_name = redirect_match.groups()
-            target = single_name or double_name or plain_name or ""
-            abs_path = _resolve_path(target)
-            try:
-                completed = _run_cat_stdin_redirect(abs_path, append=operator == ">>")
-                rendered = "" if completed else "^C"
-                last_exit_status = 0 if completed else 130
-            except PermissionError:
-                rendered = f"bash: {target}: Permission denied"
-                send_response_lines_shell(chan, rendered, "")
-                last_exit_status = 1
-            record_session(session_log, cmd, rendered, "write")
-            _safe_send(chan, _prompt())
+        selected_tool = select_interactive_tool(cmd, client)
+        terminal_width = max(20, int(getattr(terminal_state, "pty_width", 80) or 80))
+        terminal_height = max(8, int(getattr(terminal_state, "pty_height", 24) or 24))
+        interactive_status = dispatch_interactive_tool(
+            selected_tool,
+            InteractiveToolContext(
+                command=cmd,
+                prompt=_prompt,
+                send_response=lambda text, prompt: send_response_lines_shell(chan, text, prompt),
+                send_text=lambda text: _safe_send(chan, text),
+                record_session=lambda command, output, classification: record_session(
+                    session_log,
+                    command,
+                    output,
+                    classification,
+                ),
+                resolve_path=_resolve_path,
+                run_cat_stdin_redirect=lambda path, append: _run_cat_stdin_redirect(path, append),
+                run_ping_interactive=_run_ping_interactive,
+                render_top_frame=lambda: _top_frame(terminal_width, terminal_height),
+                run_top_interactive=lambda interval: _run_top_interactive(interval=interval),
+                run_nano_interactive=_run_nano_interactive,
+                top_refresh_seconds=TOP_REFRESH_SEC,
+            ),
+        )
+        if interactive_status is not None:
+            last_exit_status = interactive_status
             buffer.clear()
             cursor = 0
             hist_idx = len(history)
             return None
-
-        if re.match(r"^\s*ping(?:\s|$)", cmd):
-            rendered, last_exit_status = _run_ping_interactive(cmd)
-            record_session(session_log, cmd, rendered, "read")
-            _safe_send(chan, _prompt())
-            buffer.clear()
-            cursor = 0
-            hist_idx = len(history)
-            return None
-
-        if cmd == "top" or cmd.startswith("top "):
-            try:
-                args = cmd.split()[1:]
-                batch = False
-                iters = 1
-                refresh_interval = TOP_REFRESH_SEC
-
-                i = 0
-                while i < len(args):
-                    a = args[i]
-                    if a == "--batch":
-                        batch = True
-                    elif a == "--iterations" and i + 1 < len(args) and args[i + 1].isdigit():
-                        iters = max(1, int(args[i + 1]))
-                        i += 1
-                    elif a == "--delay" and i + 1 < len(args):
-                        try:
-                            refresh_interval = max(0.5, float(args[i + 1]))
-                            i += 1
-                        except ValueError:
-                            pass
-                    elif a.startswith("-") and not a.startswith("--") and len(a) > 1:
-                        j = 1
-                        while j < len(a):
-                            flag = a[j]
-                            if flag == "b":
-                                batch = True
-                                j += 1
-                            elif flag in ("n", "d"):
-                                rest = a[j + 1:]
-                                value: Optional[str] = None
-                                if rest:
-                                    value = rest
-                                    j = len(a)
-                                elif i + 1 < len(args):
-                                    value = args[i + 1]
-                                    i += 1
-                                    j = len(a)
-                                else:
-                                    j = len(a)
-                                if flag == "n" and value is not None and value.isdigit():
-                                    iters = max(1, int(value))
-                                elif flag == "d" and value is not None:
-                                    try:
-                                        refresh_interval = max(0.5, float(value))
-                                    except ValueError:
-                                        pass
-                            else:
-                                j += 1
-                    i += 1
-
-                if batch:
-                    frames: List[str] = []
-                    for frame_index in range(iters):
-                        frames.append(_top_frame())
-                        if frame_index + 1 < iters:
-                            time.sleep(refresh_interval)
-                    out_text = "\n\n".join(frames)
-                    send_response_lines_shell(chan, out_text, _prompt())
-                    record_session(session_log, cmd, out_text, "read")
-                else:
-                    record_session(session_log, cmd, "<interactive top>", "read")
-                    _run_top_interactive(interval=refresh_interval)
-                    _safe_send(chan, _prompt())
-                last_exit_status = 0
-
-            except Exception as e:
-                send_response_lines_shell(chan, f"top: {e}", _prompt())
-                record_session(session_log, cmd, f"top: {e}", "read")
-                last_exit_status = 1
-
-            buffer.clear()
-            cursor = 0
-            hist_idx = len(history)
-            return None
-
-        if cmd == "nano" or cmd.startswith("nano "):
-            try:
-                parts = cmd.split(maxsplit=1)
-                if len(parts) < 2 or not parts[1].strip():
-                    out = "nano: missing file operand"
-                    send_response_lines_shell(chan, out, _prompt())
-                    record_session(session_log, cmd, out, "read")
-                    last_exit_status = 1
-                else:
-                    rel = parts[1].strip()
-                    abs_path = _resolve_path(rel)
-                    record_session(session_log, cmd, "<interactive nano>", "read")
-                    _run_nano_interactive(abs_path)
-                    _safe_send(chan, _prompt())
-                    last_exit_status = 0
-            except Exception as e:
-                out = f"nano: {e}"
-                send_response_lines_shell(chan, out, _prompt())
-                record_session(session_log, cmd, out, "read")
-                last_exit_status = 1
-
-            buffer.clear()
-            cursor = 0
-            hist_idx = len(history)
-            return None
-
-
-        try:
-            known_label = classify_known_ubuntu_command(cmd, system_log)
-            if known_label is not None:
-                classification = known_label
-            elif hasattr(vuln_agent, "route_label"):
-                classification = vuln_agent.route_label(cmd, client=client)
-            else:
-                classification = validate_command(client, cmd)
-        except Exception as e:
-            log_attack(f"[{session_id}] classify error: {e}", "warn")
-            classification = "read"
-
 
         pruned_history = planner.get_pruned_history() if planner is not None else []
+        result = execute_command(
+            cmd,
+            vuln_agent,
+            system_log,
+            pruned_history,
+            prior_exit_status=prior_exit_status,
+            authoritative_resolver=_authoritative_shell_output,
+            error_logger=lambda phase, error: log_attack(
+                f"[{session_id}] {phase} error: {error}",
+                "warn",
+            ),
+            width=shell_width,
+            login_username=login_username,
+            remote_addr=remote_addr,
+            login_time=login_time,
+        )
+        system_log = result.system_log
+        current_path = system_log.get("cwd", current_path)
+        file_tree = system_log.get("filesystem", file_tree)
+        last_exit_status = result.exit_status
 
-        if classification == "rejection":
-            tool = (cmd.split() or ["cmd"])[0]
-            output = f"bash: {tool}: command not found"
-            send_response_lines_shell(chan, output, _prompt())
-            record_session(session_log, cmd, output, classification)
-            last_exit_status = 127
-            try:
-                pre_snapshot = copy.deepcopy(system_log)
-                post_snapshot = copy.deepcopy(system_log)
-                planner.step(cmd, output, pre_snapshot, post_snapshot)
-            except Exception:
-                pass
-
-        elif classification == "write":
-            try:
-                pre_snapshot = copy.deepcopy(system_log)
-
-                system_log = vuln_agent.process_write_command(cmd, client=client)
-                current_path = system_log.get("cwd", current_path)
-                file_tree = system_log.get("filesystem", file_tree)
-
-                if not bool(getattr(vuln_agent, "last_handled_local", False)):
-                    rendered = str(system_log.get("last_output") or "")
-                    last_exit_status = int(system_log.get("last_exit_status", 0) or 0)
-                else:
-                    post_snapshot = copy.deepcopy(system_log)
-                    system_ctx = copy.deepcopy(post_snapshot)
-                    system_ctx["pre_snapshot"] = pre_snapshot
-                    authoritative = _authoritative_shell_output(cmd, prior_exit_status)
-                    if authoritative is None:
-                        authoritative = str(system_log.get("last_output") or "")
-                    rendered = render_command_response(
-                        cmd,
-                        classification,
-                        pruned_history,
-                        system_ctx,
-                        authoritative_reference=authoritative,
-                        width=shell_width,
-                        login_username=login_username,
-                        remote_addr=remote_addr,
-                        login_time=login_time,
-                    )
-                    last_exit_status = _command_status(cmd, rendered, classification)
-
-                post_snapshot = copy.deepcopy(system_log)
-
-                send_response_lines_shell(chan, rendered, _prompt())
-                record_session(session_log, cmd, rendered, classification)
-                planner.step(cmd, rendered, pre_snapshot, post_snapshot)
-
-            except Exception as e:
-                log_attack(f"[{session_id}] write render error: {e}", "warn")
-                tool = (cmd.split() or ["cmd"])[0]
-                err = f"{tool}: Resource temporarily unavailable"
-                send_response_lines_shell(chan, err, _prompt())
-                record_session(session_log, cmd, err, classification)
-                last_exit_status = 1
-                try:
-                    pre_snapshot = copy.deepcopy(system_log)
-                    post_snapshot = copy.deepcopy(system_log)
-                    planner.step(cmd, err, pre_snapshot, post_snapshot)
-                except Exception:
-                    pass
-
+        if cmd == "clear":
+            _safe_send(chan, "\x1b[H\x1b[2J")
+            _safe_send(chan, _prompt())
         else:
-            try:
-                system_log = refresh_system_log_for_planning(system_log, vuln_agent)
-                current_path = system_log.get("cwd", current_path)
-                file_tree = system_log.get("filesystem", file_tree)
-
-                pre_snapshot = copy.deepcopy(system_log)
-                post_snapshot = copy.deepcopy(system_log)
-                system_ctx = copy.deepcopy(post_snapshot)
-                system_ctx["pre_snapshot"] = pre_snapshot
-
-                authoritative = _authoritative_shell_output(cmd, prior_exit_status)
-                rendered = render_command_response(
-                    cmd,
-                    classification,
-                    pruned_history,
-                    system_ctx,
-                    authoritative_reference=authoritative,
-                    width=shell_width,
-                    login_username=login_username,
-                    remote_addr=remote_addr,
-                    login_time=login_time,
-                )
-
-            except Exception as e:
-                log_attack(f"[{session_id}] render error: {e}", "warn")
-                tool = primary_command_name(cmd) or "cmd"
-                if command_is_available(cmd, system_log) is True:
-                    rendered = f"{tool}: Resource temporarily unavailable"
-                else:
-                    rendered = f"bash: {tool}: command not found"
-                try:
-                    pre_snapshot = copy.deepcopy(system_log)
-                    post_snapshot = copy.deepcopy(system_log)
-                except Exception:
-                    pre_snapshot, post_snapshot = {}, {}
-
-            if cmd == "clear":
-                _safe_send(chan, "\x1b[H\x1b[2J")
-                _safe_send(chan, _prompt())
-            else:
-                send_response_lines_shell(chan, rendered, _prompt())
-            record_session(session_log, cmd, rendered, classification)
-            last_exit_status = _command_status(cmd, rendered, classification)
-            try:
-                planner.step(cmd, rendered, pre_snapshot, post_snapshot)
-            except Exception:
-                pass
+            send_response_lines_shell(chan, result.rendered, _prompt())
+        record_session(session_log, cmd, result.rendered, result.classification)
+        try:
+            planner.step(
+                cmd,
+                result.rendered,
+                result.pre_snapshot,
+                result.post_snapshot,
+            )
+        except Exception:
+            pass
         buffer.clear()
         cursor = 0
         return None
@@ -1133,23 +944,10 @@ def handle_exec_command_once(
     system_log["cwd"] = str(system_log["identity"]["home"])
     vuln_agent.system_log = system_log
 
-    current_path = system_log.get("cwd", str(system_log["identity"]["home"]))
-    file_tree = system_log.get("filesystem", {})
-
     cmd = (exec_cmd or "").strip()
     log_attack(f"[{session_id}] EXEC received (no-pty): {cmd}")
 
     if not cmd:
-        try:
-            chan.send_exit_status(0)
-        except Exception:
-            pass
-        return
-
-    if cmd == "hostname":
-        rendered = HOSTNAME + "\n"
-        _safe_send(chan, rendered.replace("\n", "\r\n"))
-        record_session(session_log, cmd, rendered, "read")
         try:
             chan.send_exit_status(0)
         except Exception:
@@ -1166,107 +964,43 @@ def handle_exec_command_once(
             pass
         return
 
-    try:
-        if hasattr(vuln_agent, "route_label"):
-            classification = vuln_agent.route_label(cmd, client=client)
-        else:
-            classification = validate_command(client, cmd)
-    except Exception as e:
-        log_attack(f"[{session_id}] exec classify error: {e}", "warn")
-        classification = "read"
-
-    if classification == "rejection":
-        tool = (cmd.split() or ["cmd"])[0]
-        output = f"bash: {tool}: command not found\n"
-        _safe_send(chan, output.replace("\n", "\r\n"))
-        record_session(session_log, cmd, output, classification)
-        try:
-            chan.send_exit_status(127)
-        except Exception:
-            pass
-        return
-
-    if classification == "write":
-        try:
-            pre_snapshot = copy.deepcopy(system_log)
-
-            system_log = vuln_agent.process_write_command(cmd, client=client)
-            current_path = system_log.get("cwd", current_path)
-            file_tree = system_log.get("filesystem", file_tree)
-
-            if not bool(getattr(vuln_agent, "last_handled_local", False)):
-                rendered = str(system_log.get("last_output") or "")
-                exit_status = int(system_log.get("last_exit_status", 0) or 0)
-            else:
-                post_snapshot = copy.deepcopy(system_log)
-                system_ctx = copy.deepcopy(post_snapshot)
-                system_ctx["pre_snapshot"] = pre_snapshot
-                rendered = render_command_response(
-                    cmd,
-                    classification,
-                    [],
-                    system_ctx,
-                    authoritative_reference=str(system_log.get("last_output") or ""),
-                    login_username=login_username,
-                    remote_addr=remote_addr,
-                    login_time=login_time,
-                )
-                exit_status = 0 if not str(system_log.get("last_output") or "") else 1
-            if not rendered.endswith("\n"):
-                rendered += "\n"
-
-            _safe_send(chan, rendered.replace("\n", "\r\n"))
-            record_session(session_log, cmd, rendered, classification)
-            try:
-                chan.send_exit_status(exit_status)
-            except Exception:
-                pass
-            return
-        except Exception as e:
-            log_attack(f"[{session_id}] exec write render error: {e}", "warn")
-            tool = (cmd.split() or ["cmd"])[0]
-            err = f"{tool}: Resource temporarily unavailable\n"
-            _safe_send(chan, err.replace("\n", "\r\n"))
-            record_session(session_log, cmd, err, classification)
-            try:
-                chan.send_exit_status(1)
-            except Exception:
-                pass
-            return
-
-    try:
-        system_log = refresh_system_log_for_planning(system_log, vuln_agent)
-        current_path = system_log.get("cwd", current_path)
-        file_tree = system_log.get("filesystem", file_tree)
-
-        pre_snapshot = copy.deepcopy(system_log)
-        post_snapshot = copy.deepcopy(system_log)
-        system_ctx = copy.deepcopy(post_snapshot)
-        system_ctx["pre_snapshot"] = pre_snapshot
-
-        rendered = render_command_response(
-            cmd,
-            classification,
+    def authoritative_exec_output(
+        command: str,
+        prior_status: int,
+        active_system_log: Dict[str, Any],
+    ) -> Optional[str]:
+        return render_authoritative_shell_output(
+            command,
+            prior_status,
+            active_system_log,
+            str(active_system_log.get("cwd") or active_system_log["identity"]["home"]),
+            login_username,
+            HOSTNAME,
             [],
-            system_ctx,
-            is_tty=False,
-            login_username=login_username,
-            remote_addr=remote_addr,
-            login_time=login_time,
+            lambda: build_top_state(active_system_log, time.time(), {}, None)[0]["processes"],
         )
-        if not rendered.endswith("\n"):
-            rendered += "\n"
-    except Exception as e:
-        log_attack(f"[{session_id}] exec render error: {e}", "warn")
-        tool = primary_command_name(cmd) or "cmd"
-        if command_is_available(cmd, system_log) is True:
-            rendered = f"{tool}: Resource temporarily unavailable\n"
-        else:
-            rendered = f"bash: {tool}: command not found\n"
 
+    result = execute_command(
+        cmd,
+        vuln_agent,
+        system_log,
+        [],
+        authoritative_resolver=authoritative_exec_output,
+        error_logger=lambda phase, error: log_attack(
+            f"[{session_id}] exec {phase} error: {error}",
+            "warn",
+        ),
+        is_tty=False,
+        login_username=login_username,
+        remote_addr=remote_addr,
+        login_time=login_time,
+    )
+    rendered = result.rendered
+    if not rendered.endswith("\n"):
+        rendered += "\n"
     _safe_send(chan, rendered.replace("\n", "\r\n"))
-    record_session(session_log, cmd, rendered, classification)
+    record_session(session_log, cmd, rendered, result.classification)
     try:
-        chan.send_exit_status(0)
+        chan.send_exit_status(result.exit_status)
     except Exception:
         pass

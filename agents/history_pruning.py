@@ -363,7 +363,3 @@ class OnlinePruner:
             update_unimportance(self.W, current_t=t, G_max=self.G_max)
             worst = max(self.W, key=lambda x: (U_tuple(x), -x.t))
             self.W.remove(worst)
-
-    def get_context_indices(self) -> List[int]:
-        return [e.t for e in self.W]
-

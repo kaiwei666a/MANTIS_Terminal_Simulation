@@ -31,10 +31,6 @@ def ts_utc_isoz() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def forced_tool_choice(tool_name: str) -> Dict[str, Any]:
-    return {"type": "function", "function": {"name": tool_name}}
-
-
 def parse_exact_command_arguments(
     arguments: str,
     original_command: str,
