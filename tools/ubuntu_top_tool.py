@@ -167,51 +167,6 @@ def collect_live_top_metrics() -> Optional[Dict[str, Any]]:
         return None
 
 
-def render_top_frame_fallback(state: Dict[str, Any]) -> str:
-    now_hms = str(state.get("observed_at") or fmt_eastern("%H:%M:%S"))
-    up = state.get("uptime_str") or format_top_uptime(float(state.get("uptime_sec", 0.0)))
-    users = int(state.get("users", 1))
-    la = state.get("loadavg") or [0.06, 0.08, 0.10]
-    la1, la5, la15 = float(la[0]), float(la[1]), float(la[2])
-
-    tasks_total = int(state.get("tasks_total", 0))
-    tasks_running = int(state.get("tasks_running", 1))
-    tasks_sleeping = int(state.get("tasks_sleeping", max(0, tasks_total - tasks_running)))
-    tasks_stopped = int(state.get("tasks_stopped", 0))
-    tasks_zombie = int(state.get("tasks_zombie", 0))
-
-    cpu = state.get("cpu") or {"us": 0.7, "sy": 0.3, "ni": 0.0, "id": 98.7, "wa": 0.2, "hi": 0.0, "si": 0.1, "st": 0.0}
-    cpu_display = {
-        key: round(max(0.0, float(cpu.get(key, 0.0))), 1)
-        for key in ("us", "sy", "ni", "id", "wa", "hi", "si", "st")
-    }
-    non_idle = sum(cpu_display[key] for key in ("us", "sy", "ni", "wa", "hi", "si", "st"))
-    cpu_display["id"] = round(max(0.0, 100.0 - non_idle), 1)
-    mem = state.get("memory") or {"total_mib": 2048.0, "free_mib": 812.4, "used_mib": 531.8, "buff_cache_mib": 703.8}
-    sw = state.get("swap") or {"total_mib": 1024.0, "free_mib": 1024.0, "used_mib": 0.0}
-    swap_avail = float(mem.get("free_mib", 0.0)) + float(mem.get("buff_cache_mib", 0.0))
-
-    procs = state.get("processes") or []
-
-    lines: List[str] = []
-    lines.append(f"top - {now_hms} {up},  {users} user,  load average: {la1:.2f}, {la5:.2f}, {la15:.2f}")
-    lines.append(f"Tasks: {tasks_total:3d} total,   {tasks_running:1d} running, {tasks_sleeping:3d} sleeping,   {tasks_stopped:1d} stopped,   {tasks_zombie:1d} zombie")
-    lines.append(f"%Cpu(s):  {cpu_display['us']:3.1f} us,  {cpu_display['sy']:3.1f} sy,  {cpu_display['ni']:3.1f} ni, {cpu_display['id']:3.1f} id,  {cpu_display['wa']:3.1f} wa,  {cpu_display['hi']:3.1f} hi,  {cpu_display['si']:3.1f} si,  {cpu_display['st']:3.1f} st")
-    lines.append(f"MiB Mem : {float(mem.get('total_mib',0.0)):7.1f} total, {float(mem.get('free_mib',0.0)):7.1f} free, {float(mem.get('used_mib',0.0)):7.1f} used, {float(mem.get('buff_cache_mib',0.0)):7.1f} buff/cache")
-    lines.append(f"MiB Swap: {float(sw.get('total_mib',0.0)):7.1f} total, {float(sw.get('free_mib',0.0)):7.1f} free, {float(sw.get('used_mib',0.0)):7.1f} used. {swap_avail:7.1f} avail Mem")
-    lines.append("")
-    lines.append("  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND")
-
-    for p in procs[:25]:
-        lines.append(
-            f"{int(p.get('pid', 0)):5d} {str(p.get('user','root')):<8} {int(p.get('pr',20)):2d} {int(p.get('ni',0)):3d} "
-            f"{str(p.get('virt','0m')):>7} {str(p.get('res','0m')):>6} {str(p.get('shr','0m')):>6} {str(p.get('state','S')):<1} "
-            f"{float(p.get('%cpu',0.0)):5.1f} {float(p.get('%mem',0.0)):4.1f} {str(p.get('time_plus','0:00.00')):>9} {str(p.get('cmd','-'))}"
-        )
-
-    return "\n".join(lines)
-
-
 def style_top_interactive_frame(
     frame: str,
     terminal_width: int = 80,
@@ -219,8 +174,6 @@ def style_top_interactive_frame(
 ) -> str:
     width = max(20, int(terminal_width or 80))
     height = max(8, int(terminal_height or 24))
-    # Leave the final column unused so a full-width row cannot auto-wrap and
-    # scroll the alternate screen when the last row is drawn.
     content_width = max(1, width - 1)
     lines = frame.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     lines = lines[:height]
@@ -387,3 +340,112 @@ def build_top_state(
         "processes": procs,
     }
     return state, top_own_pid
+
+
+def validate_top_frame(rendered: str, terminal_height: int) -> str:
+    required_markers = ("top -", "Tasks:", "%Cpu(s):", "MiB Mem", "PID")
+    if not rendered or not all(marker in rendered for marker in required_markers):
+        raise ValueError("LLM returned an incomplete top frame")
+    height = max(8, int(terminal_height or 24))
+    normalized = rendered.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    rendered_lines = normalized.split("\n")
+    rendered_lines = rendered_lines[:height]
+
+    used_pids = {
+        int(match.group(1))
+        for line in rendered_lines[7:]
+        if (match := re.match(r"^\s*(\d+)\s", line)) is not None
+    }
+    filler_pid = max(used_pids, default=9000) + 1
+    for index in range(7, height):
+        if index < len(rendered_lines) and rendered_lines[index].strip():
+            continue
+        filler = (
+            f"{filler_pid:7d} root      20   0       0      0      0 S   "
+            "0.0   0.0   0:00.00 kworker/0:0"
+        )
+        if index < len(rendered_lines):
+            rendered_lines[index] = filler
+        else:
+            rendered_lines.append(filler)
+        filler_pid += 1
+
+    process_states = []
+    for line in rendered_lines[7:]:
+        fields = line.split()
+        if len(fields) >= 8 and fields[0].isdigit():
+            process_states.append(fields[7][:1])
+    if process_states:
+        running = process_states.count("R")
+        stopped = process_states.count("T")
+        zombie = process_states.count("Z")
+        sleeping = len(process_states) - running - stopped - zombie
+        tasks_index = next(
+            (index for index, line in enumerate(rendered_lines) if line.startswith("Tasks:")),
+            None,
+        )
+        if tasks_index is not None:
+            rendered_lines[tasks_index] = (
+                f"Tasks: {len(process_states):3d} total, {running:3d} running, "
+                f"{sleeping:3d} sleeping, {stopped:3d} stopped, {zombie:3d} zombie"
+            )
+    return "\n".join(rendered_lines)
+
+
+def run_top_interactive(*, chan, terminal_state, render_frame, send, interval: float):
+    old_timeout = None
+    last_frame = ""
+    try:
+        try:
+            old_timeout = chan.gettimeout()
+        except Exception:
+            old_timeout = None
+
+        try:
+            chan.settimeout(0.0)
+        except Exception:
+            pass
+
+        terminal_width = max(20, int(getattr(terminal_state, "pty_width", 80) or 80))
+        terminal_height = max(8, int(getattr(terminal_state, "pty_height", 24) or 24))
+        last_frame = style_top_interactive_frame(
+            render_frame(terminal_width, terminal_height),
+            terminal_width=terminal_width,
+            terminal_height=terminal_height,
+        ).replace("\n", "\r\n")
+        send(chan, "\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J")
+        send(chan, last_frame)
+        last_render = time.time()
+
+        while True:
+            if chan.recv_ready():
+                data = chan.recv(1024)
+                if not data:
+                    return
+                if b"q" in data or b"Q" in data or b"\x03" in data:
+                    return
+
+            now = time.time()
+            if now - last_render >= interval:
+                terminal_width = max(20, int(getattr(terminal_state, "pty_width", 80) or 80))
+                terminal_height = max(8, int(getattr(terminal_state, "pty_height", 24) or 24))
+                last_render = now
+                last_frame = style_top_interactive_frame(
+                    render_frame(terminal_width, terminal_height),
+                    terminal_width=terminal_width,
+                    terminal_height=terminal_height,
+                ).replace("\n", "\r\n")
+
+                send(chan, "\x1b[H\x1b[2J")
+                send(chan, last_frame)
+
+            time.sleep(0.05)
+    finally:
+        send(chan, "\x1b[0m\x1b[?25h\x1b[?1049l\r\x1b[K")
+        if last_frame:
+            send(chan, last_frame)
+            send(chan, "\x1b[0m\r\n")
+        try:
+            chan.settimeout(old_timeout)
+        except Exception:
+            pass

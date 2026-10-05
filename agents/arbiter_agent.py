@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import copy
 import traceback
 import re
 from typing import Any, Callable, Dict, Optional, List
 
-from terminal_config import SYSTEM_JSON
+from openai import OpenAI
+from tools.interactive_tools import (
+    INTERACTIVE_TOOL_DEFINITIONS,
+    NO_INTERACTIVE_TOOL,
+    fallback_interactive_tool,
+)
+
+from terminal_config import SYSTEM_JSON, CLASSIFIER_MODEL_DIR
 from tools.mutation_executor import MutationExecutor
 from tools.mutation_tools import (
     MUTATION_TOOL_NAMES,
@@ -42,7 +50,116 @@ DEFAULT_PLANNER_MODEL = os.getenv("RESPONSE_AGENT_MODEL", "gpt-5.4-mini")
 PLANNER_MAX_NEW_TOKENS = int(os.getenv("RESPONSE_AGENT_MAX_NEW_TOKENS", "512"))
 
 
-class VulnerabilityAgentLLM:
+DEFAULT_ROUTER_MODEL = os.getenv(
+    "INTERACTIVE_ROUTER_MODEL", os.getenv("RESPONSE_AGENT_MODEL", "gpt-5.4-mini")
+)
+
+def select_interactive_tool(cmd: str, client: Optional[OpenAI], model: Optional[str] = None) -> str:
+    if client is None:
+        return fallback_interactive_tool(cmd)
+    try:
+        messages = [
+            {
+                "role": "developer",
+                "content": (
+                    "Classify one shell command line purely by its surface syntax -- do not run it or "
+                    "reason about semantics. Call exactly one tool: the interactive tool whose "
+                    "description matches this command's syntax, or no_interactive_tool if none do."
+                ),
+            },
+            {"role": "user", "content": cmd},
+        ]
+        resp = client.chat.completions.create(
+            model=model or DEFAULT_ROUTER_MODEL,
+            messages=messages,
+            store=False,
+            reasoning_effort="none",
+            temperature=0.0,
+            max_completion_tokens=32,
+            tools=INTERACTIVE_TOOL_DEFINITIONS,
+            tool_choice="required",
+            parallel_tool_calls=False,
+        )
+        message = resp.choices[0].message
+        for tool_call in getattr(message, "tool_calls", None) or []:
+            function = getattr(tool_call, "function", None)
+            if function is not None and function.name:
+                return function.name
+        return NO_INTERACTIVE_TOOL
+    except Exception:
+        return fallback_interactive_tool(cmd)
+
+
+logger = logging.getLogger(__name__)
+
+
+ID2LABEL = {0: "read", 1: "write", 2: "rejection"}
+LABEL2ID = {v: k for k, v in ID2LABEL.items()}
+
+
+class LocalClassifier:
+    def __init__(self, model_dir: str = CLASSIFIER_MODEL_DIR, device: Optional[str] = None):
+        if not os.path.isdir(model_dir):
+            raise FileNotFoundError(
+                f"Classifier model directory does not exist: {model_dir}. "
+                "Place the model in model/modernbert_par_2_jaur_1 or set CLASSIFIER_MODEL_DIR."
+            )
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_dir, local_files_only=True)
+        self.model.to(self.device)
+        self.model.eval()
+        logger.info("Local classifier loaded from %s on %s", model_dir, self.device)
+
+    def predict_label(self, text: str) -> str:
+        import torch
+
+        inputs = self.tokenizer(
+            text,
+            truncation=True,
+            max_length=256,
+            padding="max_length",
+            return_tensors="pt",
+        ).to(self.device)
+        with torch.no_grad():
+            logits = self.model(**inputs).logits
+        pred_id = int(torch.argmax(logits, dim=-1).item())
+        return ID2LABEL.get(pred_id, "rejection")
+
+
+_classifier: Optional[LocalClassifier] = None
+
+
+def _get_classifier() -> LocalClassifier:
+    global _classifier
+    if _classifier is None:
+        _classifier = LocalClassifier()
+    return _classifier
+
+
+def validate_command(
+    _client: Any,
+    command: str,
+) -> str:
+    try:
+        clf = _get_classifier()
+        label = clf.predict_label(command)
+        if label in {"read", "write", "rejection"}:
+            return label
+        return "read"
+    except Exception:
+        logger.exception(
+            "Local classifier failed (model directory: %s); falling back to read. "
+            "Check CLASSIFIER_MODEL_DIR, model files, and runtime dependencies.",
+            CLASSIFIER_MODEL_DIR,
+        )
+        return "read"
+
+
+class ArbiterAgent:
     def __init__(
         self,
         cve_list: Optional[List[str]] = None,
@@ -170,11 +287,6 @@ class VulnerabilityAgentLLM:
             temperature=0.0,
             max_completion_tokens=max(PLANNER_MAX_NEW_TOKENS, 1200),
         )
-        # The model reports terminal_output/exit_status via the single
-        # execute_ubuntu_command tool, and calls the mutation tools
-        # (write_file, touch_path, ...) directly -- one call per persistent
-        # effect -- instead of returning a generic "mutations" array that
-        # Python then has to switch on.
         request["tools"] = [
             ubuntu_command_tool_definition(command),
             *mutation_tool_definitions(),
@@ -227,8 +339,7 @@ class VulnerabilityAgentLLM:
             return "read"
         try:
             if client is not None:
-                from agents.strategic_agent import validate_command as _validate_command
-                label = _validate_command(client, command)
+                label = validate_command(client, command)
                 if label in {"read", "write", "rejection"}:
                     return label
         except Exception:

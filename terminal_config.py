@@ -41,6 +41,8 @@ UPLOAD_QUARANTINE_DIR = os.path.join(SCP_ROOT, "_quarantine")
 
 DOCKER_DOWNLOAD_CONTAINER = os.environ.get("DOCKER_DOWNLOAD_CONTAINER", "terminal_sftp")
 DOCKER_DOWNLOAD_PATH = os.environ.get("DOCKER_DOWNLOAD_PATH", "/downloads")
+DOCKER_MAN_CONTAINER = os.environ.get("DOCKER_MAN_CONTAINER", "terminal_man")
+DOCKER_MAN_TIMEOUT_SEC = max(1, int(os.environ.get("DOCKER_MAN_TIMEOUT_SEC", "5")))
 DOWNLOAD_TIMEOUT_SEC = int(os.environ.get("DOWNLOAD_TIMEOUT_SEC", "15"))
 DOWNLOAD_MAX_BYTES = int(
     os.environ.get("DOWNLOAD_MAX_BYTES", str(20 * 1024 * 1024))

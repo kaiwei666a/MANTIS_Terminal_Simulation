@@ -30,7 +30,6 @@ from system_state import (
     mode_string_from_octal as _mode_string_from_octal,
 )
 from tools.common import sha1_text
-from tools.ubuntu_local_capabilities import DEFER_TO_LLM, local_write_capability
 
 
 class MutationHost(Protocol):
@@ -140,9 +139,6 @@ class MutationExecutor:
             if created:
                 node["dir_mtime"] = meta["mtime"]
 
-        # Each mutation tool the model can call gets its own handler here;
-        # dispatch below is a plain dict lookup keyed by the tool name the
-        # model actually invoked -- no if/elif chain deciding which op runs.
         def _mut_write_file(mutation: Dict[str, Any]) -> None:
             path = absolute_path(mutation.get("path"), allow_critical=True)
             content = mutation.get("content", "")
@@ -390,10 +386,7 @@ class MutationExecutor:
         if not tokens:
             return True
 
-        if local_write_capability(cmd) == DEFER_TO_LLM:
-            return False
-
-        if tokens[0] == "sudo" and len(tokens) >= 2 and tokens[1] in ("-i", "-s", "--login", "--shell", "su"):
+        if tokens[0] == "sudo" and len(tokens) == 2 and tokens[1] in ("-i", "-s", "--login", "--shell", "su"):
             identity = self.system_log["identity"]
             identity["user"] = "root"
             identity["uid"] = identity["euid"] = 0
@@ -401,7 +394,7 @@ class MutationExecutor:
             self._emit("root shell started\n")
             return True
 
-        if tokens[0] == "su":
+        if tokens[0] == "su" and len(tokens) <= 2 and (len(tokens) == 1 or not tokens[1].startswith("-")):
             user = tokens[1] if len(tokens) >= 2 and not tokens[1].startswith("-") else "root"
             identity = self.system_log["identity"]
             identity["user"] = user
@@ -411,41 +404,44 @@ class MutationExecutor:
             self._emit(f"switched user to {user}\n")
             return True
 
-        if tokens[0] == "cd":
-            if len(tokens) > 2:
-                self._emit("bash: cd: too many arguments\n")
-                return True
+        if tokens[0] == "cd" and len(tokens) <= 2 and (
+            len(tokens) == 1 or tokens[1] == "-" or not tokens[1].startswith("-")
+        ):
             target = tokens[1] if len(tokens) == 2 else "~"
             self._emit(self.apply_cd(target))
             return True
 
-        if tokens[0] == "mv" and len(tokens) == 3:
+        if tokens[0] == "mv" and len(tokens) == 3 and not any(token.startswith("-") for token in tokens[1:]):
             self.apply_mv(tokens[1], tokens[2])
             return True
 
-        if tokens[0] == "cp" and len(tokens) == 4 and tokens[1] == "-r":
+        if tokens[0] == "cp" and len(tokens) == 4 and tokens[1] == "-r" and not any(
+            token.startswith("-") for token in tokens[2:]
+        ):
             self.apply_cp_r(tokens[2], tokens[3])
             return True
-        if tokens[0] == "cp" and len(tokens) == 3:
+        if tokens[0] == "cp" and len(tokens) == 3 and not any(token.startswith("-") for token in tokens[1:]):
             self.apply_cp(tokens[1], tokens[2])
             return True
 
-        if tokens[0] == "wget":
+        if tokens[0] == "wget" and len(tokens) == 2 and not tokens[1].startswith("-"):
             self.apply_download("wget", cmd[len("wget"):])
             return True
 
-        if tokens[0] == "systemctl" and len(tokens) == 3:
+        if tokens[0] == "systemctl" and len(tokens) == 3 and tokens[1] in {"enable", "disable"} and not tokens[2].startswith("-"):
             self.apply_systemctl(tokens[1], tokens[2])
             return True
 
-        if tokens[0] in {"python", "python3"} and tokens[1:3] == ["-m", "http.server"]:
+        if tokens[0] in {"python", "python3"} and len(tokens) in {3, 4} and tokens[1:3] == ["-m", "http.server"] and (
+            len(tokens) == 3 or tokens[3].isdigit()
+        ):
             port = int(tokens[3]) if len(tokens) == 4 else 8000
             self.apply_open_port(port, process="python-http.server")
             self._emit(f"Serving HTTP on 0.0.0.0 port {port} ...\n")
             return True
 
 
-        if len(tokens) >= 2 and tokens[0] == "git" and tokens[1] == "clone":
+        if len(tokens) in {3, 4} and tokens[0] == "git" and tokens[1] == "clone" and not tokens[2].startswith("-"):
             self.apply_git_clone(tokens)
             return True
 

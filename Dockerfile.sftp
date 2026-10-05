@@ -1,8 +1,5 @@
 FROM atmoz/sftp:latest
 
-# This single container serves SFTP uploads and performs isolated real
-# wget/curl/git replays. Docker exec runs replay commands as root, while the
-# atmoz entrypoint still creates the restricted SFTP account from Compose.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \

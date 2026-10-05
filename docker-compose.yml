@@ -1,4 +1,12 @@
 services:
+  manpages:
+    build:
+      context: .
+      dockerfile: Dockerfile.man
+    image: mantis-terminal-manpages:ubuntu-22.04
+    container_name: terminal_man
+    restart: unless-stopped
+
   sftp:
     build:
       context: .
@@ -7,8 +15,6 @@ services:
     container_name: terminal_sftp
     ports:
       - "8022:22"
-    # `atmoz/sftp` expects user definitions as the container command in the form
-    # username:password:UID[:GID[:dir]]
     command: "sftpuser:password:1001:1001:upload"
     volumes:
       - scp_data:/home/sftpuser/upload

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
-from agents.arbiter_agent import VulnerabilityAgentLLM
+from agents.arbiter_agent import ArbiterAgent, validate_command
 from system_state import save_system_log
 from terminal_config import PERSIST_SYSTEM_TO_FILE
 from tools.common import ts_utc_isoz
@@ -18,20 +18,9 @@ from tools.ubuntu_read_tools import command_exit_status
 
 
 try:
-    from agents.strategic_agent import PlanningRuntime, init_client, validate_command
-    client = init_client()
+    from agents.strategic_agent import PlanningRuntime
 except Exception as e:
-    print(f"[strategic_agent import failed] {type(e).__name__}: {e}")
-    client = None
-
-    def validate_command(_client, command: str) -> str:
-        cmd = command.strip()
-        if re.search(r"\b(rm\s+-rf\s+/|mkfs|iptables|dd\s+if=|mount|umount)\b", cmd):
-            return "rejection"
-        if re.search(r"\b(mkdir|touch|rm|mv|cp|cd|chmod|chown)\b", cmd) or re.search(r"^\s*echo\s+.+\s*(>>|>)\s*.+$", cmd):
-            return "write"
-        return "read"
-
+    print(f"[history runtime import failed] {type(e).__name__}: {e}")
     class PlanningRuntime:
         def __init__(self, K: int = 30):
             self.K = K
@@ -40,7 +29,15 @@ except Exception as e:
         def step(self, command: str, response: str, pre_snapshot: Dict[str, Any], post_snapshot: Dict[str, Any]) -> None:
             return
 
-def refresh_system_log_for_planning(system_log: Dict[str, Any], vuln_agent: VulnerabilityAgentLLM) -> Dict[str, Any]:
+try:
+    from agents.response_agent import init_client
+    client = init_client()
+except Exception as e:
+    print(f"[response client initialization failed] {type(e).__name__}: {e}")
+    client = None
+
+
+def refresh_system_log_for_planning(system_log: Dict[str, Any], vuln_agent: ArbiterAgent) -> Dict[str, Any]:
     system_log["timestamp"] = ts_utc_isoz()
     vuln_agent.system_log = system_log
     if PERSIST_SYSTEM_TO_FILE:
@@ -67,7 +64,7 @@ ErrorLogger = Callable[[str, Exception], None]
 
 def execute_command(
     cmd: str,
-    vuln_agent: VulnerabilityAgentLLM,
+    vuln_agent: ArbiterAgent,
     system_log: Dict[str, Any],
     session_history: List[Dict[str, Any]],
     *,
@@ -179,7 +176,7 @@ def execute_command(
         post_snapshot=post_snapshot,
     )
 
-def render_response_once(
+def _generate_command_response(
     cmd: str,
     classification: str,
     session_log: List[Dict[str, Any]],
@@ -246,19 +243,9 @@ def render_command_response(
     login_time: Optional[datetime] = None,
 ) -> str:
     command_available = command_is_available(cmd, system_log)
-    # Reuse output the write-mutation step already computed for these two
-    # cases instead of asking again -- not a "which renderer" choice, just
-    # avoiding redundant work.
-    if authoritative_reference is None and re.match(r"^\s*(?:cd|rmdir)(?:\s|$)", cmd):
-        authoritative_reference = str(system_log.get("last_output", ""))
-    if authoritative_reference is None and re.match(r"^\s*git\s+clone\b", cmd):
-        authoritative_reference = str(system_log.get("last_output", ""))
     if authoritative_reference is not None:
         return authoritative_reference.rstrip("\r\n")
-    # Which (if any) deterministic renderer applies -- ls/ip/cat/who/direct_exec
-    # -- is now decided by the response agent's own tool call, not a fixed
-    # Python if/elif priority chain; see agents/response_agent.py.
-    return render_response_once(
+    return _generate_command_response(
         cmd,
         classification,
         session_log,

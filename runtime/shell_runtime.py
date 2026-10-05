@@ -3,12 +3,10 @@ from __future__ import annotations
 import copy
 import os
 import re
-import shlex
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from agents.arbiter_agent import VulnerabilityAgentLLM
-from agents.interactive_router import select_interactive_tool
+from agents.arbiter_agent import ArbiterAgent, select_interactive_tool
 from system_state import load_system_log, save_system_log
 from runtime.command_runtime import (
     PlanningRuntime,
@@ -61,8 +59,6 @@ from tools.ubuntu_session_tools import (
 from tools.ubuntu_sysinfo_tools import format_shell_prompt
 from tools.ubuntu_top_tool import (
     build_top_state,
-    render_top_frame_fallback,
-    style_top_interactive_frame,
     update_time_plus,
 )
 
@@ -84,7 +80,6 @@ def send_response_lines_shell(chan, text: str, prompt: str, chunk_size: int = 10
     _safe_send(chan, prompt)
 
 
-
 def run_agent_shell(
     chan,
     session_id: str,
@@ -93,7 +88,7 @@ def run_agent_shell(
     terminal_state: Optional[Any] = None,
 ):
     login_time = now_eastern()
-    vuln_agent = VulnerabilityAgentLLM(
+    vuln_agent = ArbiterAgent(
         session_id=session_id,
         download_file_fetcher=docker_fetch_file,
         download_git_fetcher=docker_fetch_git_clone,
@@ -232,7 +227,6 @@ def run_agent_shell(
 
         state = _build_top_state(system_log)
         update_time_plus(state["processes"], delta, _top_cpu_time_by_pid)
-        fallback = render_top_frame_fallback(state).rstrip("\r\n")
         try:
             from agents.response_agent import render_top_response
 
@@ -242,206 +236,35 @@ def run_agent_shell(
                 terminal_height=terminal_height,
                 client=client,
             )
-            required_markers = ("top -", "Tasks:", "%Cpu(s):", "MiB Mem", "PID")
-            if not rendered or not all(marker in rendered for marker in required_markers):
-                raise ValueError("LLM returned an incomplete top frame")
-            rendered_lines = rendered.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-            if len(rendered_lines) != terminal_height:
-                raise ValueError(
-                    f"LLM returned {len(rendered_lines)} top rows; expected {terminal_height}"
-                )
-            if any(not line.strip() for line in rendered_lines[7:]):
-                raise ValueError("LLM left one or more top process rows empty")
-            return rendered
+            from tools.ubuntu_top_tool import validate_top_frame
+            return validate_top_frame(rendered, terminal_height)
         except Exception as exc:
-            log_attack(f"[{session_id}] top LLM refresh failed; using local fallback: {exc}", "warn")
-            return fallback
+            log_attack(f"[{session_id}] top LLM refresh failed: {exc}", "warn")
+            raise
 
     def _run_top_interactive(interval: float = TOP_REFRESH_SEC):
-        old_timeout = None
-        last_frame = ""
-        try:
-            try:
-                old_timeout = chan.gettimeout()
-            except Exception:
-                old_timeout = None
-
-            try:
-                chan.settimeout(0.0)  
-            except Exception:
-                pass
-            _safe_send(chan, "\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J")
-            last_render = 0.0
-
-            while True:
-                now = time.time()
-                if now - last_render >= interval:
-                    terminal_width = max(20, int(getattr(terminal_state, "pty_width", 80) or 80))
-                    terminal_height = max(8, int(getattr(terminal_state, "pty_height", 24) or 24))
-                    last_frame = style_top_interactive_frame(
-                        _top_frame(terminal_width, terminal_height),
-                        terminal_width=terminal_width,
-                        terminal_height=terminal_height,
-                    ).replace("\n", "\r\n")
-
-                    _safe_send(chan, "\x1b[H\x1b[2J")
-                    _safe_send(chan, last_frame)
-                    last_render = time.time()
-
-                if chan.recv_ready():
-                    data = chan.recv(1024)
-                    if not data:
-                        return
-                    if b"q" in data or b"Q" in data or b"\x03" in data:
-                        return
-
-                time.sleep(0.05)
-        finally:
-            _safe_send(chan, "\x1b[0m\x1b[?25h\x1b[?1049l\r\x1b[K")
-            if last_frame:
-                _safe_send(chan, last_frame)
-                _safe_send(chan, "\x1b[0m\r\n")
-            try:
-                chan.settimeout(old_timeout)
-            except Exception:
-                pass
+        from tools.ubuntu_top_tool import run_top_interactive
+        return run_top_interactive(
+            chan=chan, terminal_state=terminal_state, render_frame=_top_frame,
+            send=_safe_send, interval=interval,
+        )
 
     def _run_cat_stdin_redirect(abs_path: str, append: bool) -> bool:
-        old_timeout = None
-        try:
-            try:
-                old_timeout = chan.gettimeout()
-            except Exception:
-                old_timeout = None
-            chan.settimeout(None)
-            prefix = _read_file(abs_path) if append else ""
-            _write_file(abs_path, prefix)
-            collected: List[str] = []
-            while True:
-                data = chan.recv(1)
-                if not data:
-                    break
-                char = data.decode("utf-8", errors="ignore")
-                if char == "\x04":
-                    break
-                if char == "\x03":
-                    _safe_send(chan, "^C\r\n")
-                    _write_file(abs_path, prefix + "".join(collected))
-                    return False
-                if char in {"\r", "\n"}:
-                    if char == "\r":
-                        collected.append("\n")
-                        _safe_send(chan, "\r\n")
-                    continue
-                if char == "\x7f":
-                    if collected and collected[-1] != "\n":
-                        collected.pop()
-                        _safe_send(chan, "\b \b")
-                    continue
-                collected.append(char)
-                _safe_send(chan, char)
-            _write_file(abs_path, prefix + "".join(collected))
-            if not collected or collected[-1] != "\n":
-                _safe_send(chan, "\r\n")
-            return True
-        finally:
-            try:
-                chan.settimeout(old_timeout)
-            except Exception:
-                pass
+        from tools.ubuntu_cat_tool import run_cat_stdin_redirect
+        return run_cat_stdin_redirect(
+            abs_path, append, chan=chan, read_file=_read_file,
+            write_file=_write_file, send=_safe_send,
+        )
 
     def _run_ping_interactive(command: str) -> Tuple[str, int]:
-        try:
-            tokens = shlex.split(command, posix=True)
-        except ValueError:
-            return "ping: usage error", 2
-        count: Optional[int] = None
-        host = ""
-        index = 1
-        while index < len(tokens):
-            token = tokens[index]
-            if token in {"-c", "--count"} and index + 1 < len(tokens):
-                try:
-                    count = max(1, int(tokens[index + 1]))
-                except ValueError:
-                    return f"ping: invalid argument: '{tokens[index + 1]}'", 2
-                index += 2
-                continue
-            if token.startswith("-"):
-                return f"ping: invalid option -- '{token.lstrip('-')[:1]}'", 2
-            host = token
-            index += 1
-        if not host:
-            return "ping: usage error: Destination address required", 2
+        from agents.response_agent import generate_ping_profile
+        from tools.ubuntu_ping_tool import run_ping_interactive
+        return run_ping_interactive(
+            command, chan=chan, send=_safe_send,
+            generate_profile=lambda host: generate_ping_profile(host, client=client),
+            report_error=lambda exc: log_attack(f"[{session_id}] ping profile generation failed: {exc}", "warn"),
+        )
 
-        address = {
-            "www.google.com": "142.250.72.196",
-            "google.com": "142.250.72.14",
-            "localhost": "127.0.0.1",
-        }.get(host, host)
-        ttl = 117 if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host) else 64
-        lines = [f"PING {host} ({address}) 56(84) bytes of data."]
-        _safe_send(chan, lines[0] + "\r\n")
-        samples = [0.123, 0.118, 0.121, 0.119, 0.124]
-        sent = 0
-        interrupted = False
-        old_timeout = None
-        try:
-            try:
-                old_timeout = chan.gettimeout()
-            except Exception:
-                old_timeout = None
-            chan.settimeout(0.0)
-            next_reply = time.monotonic()
-            while count is None or sent < count:
-                if chan.recv_ready():
-                    incoming = chan.recv(1024)
-                    if not incoming:
-                        interrupted = True
-                        break
-                    if b"\x03" in incoming:
-                        interrupted = True
-                        _safe_send(chan, "^C\r\n")
-                        break
-                now = time.monotonic()
-                if now >= next_reply:
-                    sent += 1
-                    sample = samples[(sent - 1) % len(samples)]
-                    line = f"64 bytes from {address}: icmp_seq={sent} ttl={ttl} time={sample:.3f} ms"
-                    lines.append(line)
-                    _safe_send(chan, line + "\r\n")
-                    next_reply = now + 1.0
-                time.sleep(0.03)
-        finally:
-            try:
-                chan.settimeout(old_timeout)
-            except Exception:
-                pass
-
-        elapsed = max(0, (sent - 1) * 1000)
-        summary = [
-            f"--- {host} ping statistics ---",
-            f"{sent} packets transmitted, {sent} received, 0% packet loss, time {elapsed}ms",
-        ]
-        if sent:
-            used = samples[: min(sent, len(samples))]
-            average = sum(used) / len(used)
-            summary.append(f"rtt min/avg/max/mdev = {min(used):.3f}/{average:.3f}/{max(used):.3f}/0.002 ms")
-        for line in summary:
-            _safe_send(chan, line + "\r\n")
-        lines.extend(summary)
-        return "\n".join(lines), 130 if interrupted else 0
-
-    def _nano_move_cursor(row: int, col: int):
-        _safe_send(chan, f"{CSI}{row};{col}H")
-
-    def _nano_terminal_size() -> Tuple[int, int]:
-        rows = max(5, int(getattr(terminal_state, "pty_height", 24) or 24))
-        cols = max(20, int(getattr(terminal_state, "pty_width", 80) or 80))
-        return rows, cols
-
-    def _clip(n: int, lo: int, hi: int) -> int:
-        return max(lo, min(hi, n))
 
     def _recv_key_blocking() -> str:
         b = chan.recv(1)
@@ -465,222 +288,20 @@ def run_agent_shell(
         return "\x1b[" + ch3
 
     def _prompt_sudo_password(cmd: str) -> bool:
+        from tools.ubuntu_auth_tool import prompt_sudo_password
+        return prompt_sudo_password(
+            cmd, chan=chan, system_log=system_log, login_username=login_username,
+            password=SUDO_PASSWORD, recv_key=_recv_key_blocking, send=_safe_send,
+        )
 
-        old_timeout = None
-        try:
-            old_timeout = chan.gettimeout()
-        except Exception:
-            pass
-        try:
-            chan.settimeout(None)
-        except Exception:
-            pass
-        try:
-            active_user = str((system_log.get("identity") or {}).get("user") or login_username)
-            is_su = bool(re.match(r"^\s*su\b", cmd))
-            prompt_text = "Password: " if is_su else f"[sudo] password for {active_user}: "
-            fail_text = "su: Authentication failure\r\n" if is_su else "sudo: 3 incorrect password attempts\r\n"
-            for attempt in range(3):
-                _safe_send(chan, prompt_text)
-                pw_chars: List[str] = []
-                while True:
-                    k = _recv_key_blocking()
-                    if k == "":
-                        return False
-                    if k in ("\r", "\n"):
-                        break
-                    if k == "\x03":
-                        _safe_send(chan, "^C\r\n")
-                        return False
-                    if k == "\x7f":
-                        if pw_chars:
-                            pw_chars.pop()
-                        continue
-                    if len(k) == 1 and (k.isprintable() or k == " "):
-                        pw_chars.append(k)
-                _safe_send(chan, "\r\n")
-                if "".join(pw_chars) == SUDO_PASSWORD:
-                    return True
-                if attempt < 2:
-                    _safe_send(chan, "Sorry, try again.\r\n")
-            _safe_send(chan, fail_text)
-            return False
-        finally:
-            try:
-                chan.settimeout(old_timeout)
-            except Exception:
-                pass
-
-    def _render_nano(filename: str, lines: List[str], cy: int, cx: int, msg: str, dirty: bool):
-        rows, cols = _nano_terminal_size()
-        text_rows = max(1, rows - 3) 
-        top = 0
-        if cy >= top + text_rows:
-            top = cy - text_rows + 1
-        if cy < top:
-            top = cy
-
-        head = f"  GNU nano  {filename}"
-        if dirty:
-            head += "  [Modified]"
-        screen_lines = [head]
-        for r in range(text_rows):
-            li = top + r
-            screen_lines.append(lines[li] if li < len(lines) else "")
-        screen_lines.extend(("^O WriteOut   ^X Exit", msg or ""))
-
-        # Draw each row at an absolute position. Avoid CRLF and full-width
-        # padding because either can scroll the terminal when the last column
-        # or last row is reached.
-        frame = ["\x1b[?25l"]
-        for row, text in enumerate(screen_lines, start=1):
-            frame.append(f"{CSI}{row};1H{text[:cols]}{CSI}K")
-        _safe_send(chan, "".join(frame))
-
-        vy = 2 + (cy - top)  
-        vx = 1 + cx
-        vy = _clip(vy, 2, rows - 2)
-        vx = _clip(vx, 1, cols)
-        _nano_move_cursor(vy, vx)
-        _safe_send(chan, "\x1b[?25h")
 
     def _run_nano_interactive(abs_path: str):
-
-        old_timeout = None
-        alternate_screen = False
-        try:
-            try:
-                old_timeout = chan.gettimeout()
-            except Exception:
-                old_timeout = None
-            try:
-                chan.settimeout(None)
-            except Exception:
-                pass
-
-            filename = abs_path
-            content = _read_file(abs_path)
-            lines = content.split("\n")
-            if not lines:
-                lines = [""]
-
-            cy, cx = 0, 0
-            dirty = False
-            msg = ""
-
-            _safe_send(chan, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")
-            alternate_screen = True
-            _render_nano(filename, lines, cy, cx, msg, dirty)
-
-            while True:
-                k = _recv_key_blocking()
-                if k == "":
-                    break
-
-                if k == "\x18":
-                    if not dirty:
-                        msg = "Exit"
-                        _render_nano(filename, lines, cy, cx, msg, dirty)
-                        break
-
-                    msg = "Save modified buffer? (y/n)"
-                    _render_nano(filename, lines, cy, cx, msg, dirty)
-                    while True:
-                        kk = _recv_key_blocking().lower()
-                        if kk in ("y", "n"):
-                            if kk == "y":
-                                try:
-                                    _write_file(abs_path, "\n".join(lines))
-                                    dirty = False
-                                    msg = "Wrote file"
-                                except PermissionError:
-                                    msg = "Error writing file: Permission denied"
-                                except Exception as e:
-                                    msg = f"Error writing file: {e}"
-                            else:
-                                msg = "Discarded changes"
-                            _render_nano(filename, lines, cy, cx, msg, dirty)
-                            break
-                    break
-
-    
-                if k == "\x0f":
-                    try:
-                        _write_file(abs_path, "\n".join(lines))
-                        dirty = False
-                        msg = "Wrote file"
-                    except PermissionError:
-                        msg = "Error writing file: Permission denied"
-                    except Exception as e:
-                        msg = f"Error writing file: {e}"
-                    _render_nano(filename, lines, cy, cx, msg, dirty)
-                    continue
-
-                if k == "\x1b[A":
-                    cy = _clip(cy - 1, 0, len(lines) - 1)
-                    cx = _clip(cx, 0, len(lines[cy]))
-                    _render_nano(filename, lines, cy, cx, "", dirty)
-                    continue
-                if k == "\x1b[B":
-                    cy = _clip(cy + 1, 0, len(lines) - 1)
-                    cx = _clip(cx, 0, len(lines[cy]))
-                    _render_nano(filename, lines, cy, cx, "", dirty)
-                    continue
-                if k == "\x1b[C":
-                    cx = _clip(cx + 1, 0, len(lines[cy]))
-                    _render_nano(filename, lines, cy, cx, "", dirty)
-                    continue
-                if k == "\x1b[D":
-                    cx = _clip(cx - 1, 0, len(lines[cy]))
-                    _render_nano(filename, lines, cy, cx, "", dirty)
-                    continue
-
-                if k in ("\r", "\n"):
-                    left = lines[cy][:cx]
-                    right = lines[cy][cx:]
-                    lines[cy] = left
-                    lines.insert(cy + 1, right)
-                    cy += 1
-                    cx = 0
-                    dirty = True
-                    _render_nano(filename, lines, cy, cx, "", dirty)
-                    continue
-
-
-                if k == "\x7f":
-                    if cx > 0:
-                        s = lines[cy]
-                        lines[cy] = s[:cx - 1] + s[cx:]
-                        cx -= 1
-                        dirty = True
-                    elif cy > 0:
-                        prev = lines[cy - 1]
-                        cur = lines[cy]
-                        cx = len(prev)
-                        lines[cy - 1] = prev + cur
-                        del lines[cy]
-                        cy -= 1
-                        dirty = True
-                    _render_nano(filename, lines, cy, cx, "", dirty)
-                    continue
-
-                if len(k) == 1 and (" " <= k <= "~"):
-                    s = lines[cy]
-                    lines[cy] = s[:cx] + k + s[cx:]
-                    cx += 1
-                    dirty = True
-                    _render_nano(filename, lines, cy, cx, "", dirty)
-                    continue
-
-        finally:
-            if alternate_screen:
-                _safe_send(chan, "\x1b[0m\x1b[?25h\x1b[?1049l\r\x1b[K")
-            else:
-                _safe_send(chan, "\x1b[?25h")
-            try:
-                chan.settimeout(old_timeout)
-            except Exception:
-                pass
+        from tools.ubuntu_nano_tool import run_nano_interactive
+        return run_nano_interactive(
+            abs_path, chan=chan, terminal_state=terminal_state,
+            read_file=_read_file, write_file=_write_file,
+            recv_key=_recv_key_blocking, send=_safe_send,
+        )
 
     buffer: List[str] = []
     cursor: int = 0
@@ -923,7 +544,7 @@ def handle_exec_command_once(
 ):
     login_time = now_eastern()
 
-    vuln_agent = VulnerabilityAgentLLM(
+    vuln_agent = ArbiterAgent(
         session_id=session_id,
         download_file_fetcher=docker_fetch_file,
         download_git_fetcher=docker_fetch_git_clone,

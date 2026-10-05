@@ -46,6 +46,46 @@ PACKAGE_COMMANDS = {
 }
 
 
+def parse_man_request(args: list[str]) -> Optional[tuple[Optional[str], str]]:
+    if not args:
+        return None
+    section: Optional[str] = None
+    topic_index = 0
+    if len(args) >= 2 and re.fullmatch(r"[0-9][A-Za-z]*", args[0]):
+        section = args[0]
+        topic_index = 1
+    if topic_index + 1 != len(args):
+        return None
+    topic = args[topic_index]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:+-]*", topic):
+        return None
+    return section, topic
+
+
+def is_manual_or_help_command(command: str) -> bool:
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+    if not tokens or tokens[0] not in {"man", "help", "whatis"}:
+        return False
+
+    args = tokens[1:]
+    if not args or args[0] in {"--help", "-h", "--version", "-V"}:
+        return True
+    if tokens[0] == "man":
+        return parse_man_request(args) is not None
+    if tokens[0] == "whatis":
+        return all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:+-]*", topic) for topic in args)
+
+    remaining = list(args)
+    while remaining and remaining[0] in {"-d", "-m", "-s"}:
+        remaining.pop(0)
+    return len(remaining) <= 1 and (
+        not remaining or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:+-]*", remaining[0]) is not None
+    )
+
+
 
 DEFAULT_PACKAGE_STATE: Dict[str, bool] = {
     "iproute2": True,

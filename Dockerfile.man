@@ -1,0 +1,33 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN rm -f /etc/dpkg/dpkg.cfg.d/excludes \
+    && apt-get update \
+    && apt-get install -y --reinstall --no-install-recommends \
+        apt \
+        bash \
+        coreutils \
+        curl \
+        dash \
+        findutils \
+        git \
+        grep \
+        gzip \
+        iproute2 \
+        less \
+        man-db \
+        manpages \
+        manpages-dev \
+        openssh-client \
+        passwd \
+        procps \
+        sed \
+        tar \
+        util-linux \
+        wget \
+    && ln -sf /usr/bin/man.REAL /usr/bin/man \
+    && rm -rf /var/lib/apt/lists/* \
+    && mandb --quiet
+
+CMD ["sleep", "infinity"]

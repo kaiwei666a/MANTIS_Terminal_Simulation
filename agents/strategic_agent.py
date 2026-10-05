@@ -1,17 +1,10 @@
+"""Maintain command steps and pruned session history."""
 
 from __future__ import annotations
 
-import logging
-import os
-from typing import Any, Dict, List, Optional
+import json
 
-import torch
-from openai import OpenAI
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-from terminal_config import CLASSIFIER_MODEL_DIR
-
-logger = logging.getLogger(__name__)
+from typing import Any, Dict, List
 
 try:
     from agents.history_pruning import OnlinePruner
@@ -19,69 +12,47 @@ except Exception:
     OnlinePruner = None
 
 
-def init_client(api_key: Optional[str] = None) -> OpenAI:
-    key = api_key or os.getenv("OPENAI_API_KEY") or "YOUR_API_KEY_HERE"
-    return OpenAI(api_key=key)
-
-ID2LABEL = {0: "read", 1: "write", 2: "rejection"}
-LABEL2ID = {v: k for k, v in ID2LABEL.items()}
-
-
-class LocalClassifier:
-    def __init__(self, model_dir: str = CLASSIFIER_MODEL_DIR, device: Optional[str] = None):
-        if not os.path.isdir(model_dir):
-            raise FileNotFoundError(
-                f"Classifier model directory does not exist: {model_dir}. "
-                "Place the model in model/modernbert_par_2_jaur_1 or set CLASSIFIER_MODEL_DIR."
-            )
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_dir, local_files_only=True)
-        self.model.to(self.device)
-        self.model.eval()
-        logger.info("Local classifier loaded from %s on %s", model_dir, self.device)
-
-    @torch.no_grad()
-    def predict_label(self, text: str) -> str:
-        inputs = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=256,
-            padding="max_length",
-            return_tensors="pt",
-        ).to(self.device)
-        logits = self.model(**inputs).logits
-        pred_id = int(torch.argmax(logits, dim=-1).item())
-        return ID2LABEL.get(pred_id, "rejection")
-
-
-_classifier: Optional[LocalClassifier] = None
-
-
-def _get_classifier() -> LocalClassifier:
-    global _classifier
-    if _classifier is None:
-        _classifier = LocalClassifier()
-    return _classifier
-
-
-def validate_command(
-    _client: OpenAI,
-    command: str,
-) -> str:
+def _json_compact(obj: Any, limit: int = 20000) -> str:
+    """Serialize context compactly and cap its size before model input."""
     try:
-        clf = _get_classifier()
-        label = clf.predict_label(command)
-        if label in {"read", "write", "rejection"}:
-            return label
-        return "read"
+        serialized = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     except Exception:
-        logger.exception(
-            "Local classifier failed (model directory: %s); falling back to read. "
-            "Check CLASSIFIER_MODEL_DIR, model files, and runtime dependencies.",
-            CLASSIFIER_MODEL_DIR,
-        )
-        return "read"
+        serialized = str(obj)
+    if len(serialized) > limit:
+        return serialized[:limit] + "...<truncated>"
+    return serialized
+
+
+def build_response_messages(
+    command: str,
+    planning_advice: str,
+    session_log: Any,
+    system_log: Any,
+    *,
+    system_instruction: str,
+) -> List[Dict[str, str]]:
+    """Build response-model messages from command history and state transition."""
+    if isinstance(system_log, dict) and "pre_snapshot" in system_log:
+        pre_snapshot = system_log.get("pre_snapshot") or {}
+        post_snapshot = {key: value for key, value in system_log.items() if key != "pre_snapshot"}
+    else:
+        pre_snapshot = system_log
+        post_snapshot = system_log
+
+    snapshot_transition = {
+        "pre_snapshot": pre_snapshot,
+        "post_snapshot": post_snapshot,
+    }
+    user_prompt = (
+        f"{command}\n\n"
+        f"(Planning advice / constraints): {planning_advice}\n"
+        f"(Recent command history): {_json_compact(session_log)}\n"
+        f"(System snapshot transition): {_json_compact(snapshot_transition)}\n"
+    )
+    return [
+        {"role": "system", "content": system_instruction},
+        {"role": "user", "content": user_prompt},
+    ]
 
 
 class PlanningRuntime:

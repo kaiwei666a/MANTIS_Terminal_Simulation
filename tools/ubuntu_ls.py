@@ -8,6 +8,12 @@ from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from zoneinfo import ZoneInfo
+    _DISPLAY_TZ = ZoneInfo("America/New_York")
+except Exception:
+    _DISPLAY_TZ = timezone.utc
+
 
 EXT4_BLOCK_BYTES = 4096
 STAT_BLOCK_BYTES = 512
@@ -240,6 +246,8 @@ def _effective_dir_mtime(node: Dict[str, Any]) -> datetime:
 
 
 def _format_mtime(value: datetime, now: datetime) -> str:
+    value = value.astimezone(_DISPLAY_TZ)
+    now = now.astimezone(_DISPLAY_TZ)
     age_seconds = (now - value).total_seconds()
     if age_seconds > 180 * 24 * 60 * 60 or age_seconds < -60 * 60:
         return value.strftime("%b %e  %Y")
